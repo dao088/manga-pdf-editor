@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ScanText, MessageSquare } from 'lucide-react'
 import { pdfjs, registerCanvas, getCanvas, type PDFDocumentProxy } from '../lib/pdf'
-import { blocksFromOcr, blocksFromPdf, mergeBlockSets } from '../lib/blocks'
+import { blocksFromOcr, blocksFromPdf, mergeBlockSets, ocrRegion } from '../lib/blocks'
 import { clamp, contains, uid, type Rect } from '../lib/geometry'
+import { inpaintRegion } from '../lib/inpaint'
 import { detectColors, parseFontName } from '../lib/style'
 import { useStore, type Block, type TextEditT } from '../store'
 import { EditBox } from './EditBox'
@@ -100,6 +101,11 @@ export function PageView({ doc, pageNumber }: Props) {
     }
   }, [tool, visible, blocks, size, doc, pageNumber, st])
 
+  const flash = (msg: string, ms = 3000) => {
+    st.getState().setBusy(pageNumber, msg)
+    setTimeout(() => st.getState().setBusy(pageNumber, undefined), ms)
+  }
+
   const runOcr = async () => {
     const s = st.getState()
     s.setBusy(pageNumber, 'Running OCR…')
@@ -107,12 +113,23 @@ export function PageView({ doc, pageNumber }: Props) {
       const page = await doc.getPage(pageNumber)
       const ocr = await blocksFromOcr(page, pageNumber)
       s.setBlocks(pageNumber, mergeBlockSets(st.getState().blocks[pageNumber], ocr))
+      flash(`Found ${ocr.group.length} blocks — missing something? Use "Draw box"`, 5000)
     } catch (e) {
       console.error(e)
-    } finally {
-      s.setBusy(pageNumber, undefined)
+      flash('OCR failed (it needs internet the first time) — use "Draw box" instead', 7000)
     }
   }
+
+  // toolbar button: "Detect text (OCR)" for the current page
+  const runOcrRef = useRef(runOcr)
+  runOcrRef.current = runOcr
+  useEffect(() => {
+    const onOcr = (e: Event) => {
+      if ((e as CustomEvent<number>).detail === pageNumber) void runOcrRef.current()
+    }
+    window.addEventListener('mpe:ocr', onOcr)
+    return () => window.removeEventListener('mpe:ocr', onOcr)
+  }, [pageNumber])
 
   const createEdit = (b: Block) => {
     const s = st.getState()
@@ -194,6 +211,82 @@ export function PageView({ doc, pageNumber }: Props) {
     target.addEventListener('pointerup', up as EventListener)
   }
 
+  /** Manual edit: drag a box over any lettering. Colours are sampled; text is typed (OCR only suggests it). */
+  const onBoxDown = (e: React.PointerEvent) => {
+    const start = norm(e)
+    const target = e.currentTarget
+    target.setPointerCapture(e.pointerId)
+    const mk = (p: { x: number; y: number }): Rect => {
+      const x0 = clamp(Math.min(start.x, p.x), 0, 1)
+      const y0 = clamp(Math.min(start.y, p.y), 0, 1)
+      return { x: x0, y: y0, w: clamp(Math.max(start.x, p.x), 0, 1) - x0, h: clamp(Math.max(start.y, p.y), 0, 1) - y0 }
+    }
+    const move = (m: PointerEvent) => setDrag(mk(norm(m)))
+    const up = (m: PointerEvent) => {
+      target.removeEventListener('pointermove', move as EventListener)
+      target.removeEventListener('pointerup', up as EventListener)
+      const r = mk(norm(m))
+      setDrag(null)
+      if (r.w * dims.w > 12 && r.h * dims.h > 8) createManualEdit(r)
+    }
+    target.addEventListener('pointermove', move as EventListener)
+    target.addEventListener('pointerup', up as EventListener)
+  }
+
+  const coverFor = (canvas: HTMLCanvasElement, rect: Rect, ink: string) => {
+    try {
+      const img = inpaintRegion(canvas, rect, ink)
+      return img ? { rect, img, ink } : undefined
+    } catch (err) {
+      console.error(err)
+      return undefined
+    }
+  }
+
+  const createManualEdit = (rect: Rect) => {
+    const s = st.getState()
+    const canvas = getCanvas(pageNumber)
+    const colors = canvas ? detectColors(canvas, rect) : { bg: '#ffffff', color: '#000000' }
+    const id = uid()
+    const hPt = rect.h * dims.h
+    s.addEdit({
+      id,
+      page: pageNumber,
+      blockId: `manual-${id}`,
+      rect,
+      original: '',
+      text: '',
+      font: 'Comic Neue',
+      size: Math.max(6, Math.round((hPt / 1.3) * 2) / 2),
+      color: colors.color,
+      bg: colors.bg,
+      bold: true,
+      italic: false,
+      align: 'center',
+      lineHeight: 1.15,
+      autoFit: true,
+      cover: canvas ? coverFor(canvas, rect, colors.color) : undefined,
+      outline: colors.bg === '#ffffff' || parseInt(colors.bg.slice(1, 3), 16) > 200 ? '' : '#ffffff',
+    })
+    // optional suggestion: never blocks typing, only fills the box if it is still empty
+    s.setBusy(pageNumber, 'Reading text…')
+    void (async () => {
+      try {
+        const page = await doc.getPage(pageNumber)
+        const { text, lines } = await ocrRegion(page, rect)
+        const cur = st.getState().edits.find((x) => x.id === id)
+        if (cur && !cur.text && text) {
+          const size = Math.max(6, Math.round((hPt / (lines * cur.lineHeight * 1.1)) * 2) / 2)
+          st.getState().updateEdit(id, { text, original: text, size })
+        }
+        flash(text ? 'Text suggested — fix it as needed' : 'Could not read it — just type the text', 3500)
+      } catch (err) {
+        console.error(err)
+        flash('Could not read it — just type the text', 3500)
+      }
+    })()
+  }
+
   const hovered = hover ? comments.find((c) => c.id === hover.id) : null
   const visibleBlocks = (blocks?.[granularity] ?? []).filter((b) => !edits.some((e) => e.blockId === b.id))
 
@@ -201,7 +294,7 @@ export function PageView({ doc, pageNumber }: Props) {
     <div className="mx-auto mb-6" style={{ width: pxW }}>
       <div className="mb-1 flex items-center justify-between text-xs text-neutral-400">
         <span>Page {pageNumber}</span>
-        {tool === 'edit' && (
+        {(tool === 'edit' || tool === 'box') && (
           <button
             onClick={runOcr}
             disabled={!!busy}
@@ -289,9 +382,41 @@ export function PageView({ doc, pageNumber }: Props) {
           </div>
         )}
 
+        {/* manual box drawing */}
+        {tool === 'box' && (
+          <div className="absolute inset-0 z-40 cursor-crosshair" onPointerDown={onBoxDown}>
+            {drag && (
+              <div
+                className="absolute border-2 border-dashed border-blue-500 bg-blue-500/15"
+                style={{ left: `${drag.x * 100}%`, top: `${drag.y * 100}%`, width: `${drag.w * 100}%`, height: `${drag.h * 100}%` }}
+              />
+            )}
+          </div>
+        )}
+
+        {/* rebuilt backgrounds under removed lettering */}
+        {edits.map(
+          (e) =>
+            e.cover && (
+              <img
+                key={`c-${e.id}`}
+                src={e.cover.img}
+                alt=""
+                draggable={false}
+                className="pointer-events-none absolute z-[29]"
+                style={{
+                  left: `${e.cover.rect.x * 100}%`,
+                  top: `${e.cover.rect.y * 100}%`,
+                  width: `${e.cover.rect.w * 100}%`,
+                  height: `${e.cover.rect.h * 100}%`,
+                }}
+              />
+            ),
+        )}
+
         {/* text edits */}
         {edits.map((e) => (
-          <EditBox key={e.id} edit={e} scale={scale} pageW={dims.w} pageH={dims.h} />
+          <EditBox key={e.id} edit={e} scale={scale} pageW={dims.w} pageH={dims.h} raised={tool === 'box' || tool === 'edit'} />
         ))}
 
         {/* detected blocks (edit tool) */}

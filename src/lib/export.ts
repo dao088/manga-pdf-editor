@@ -13,8 +13,10 @@ async function renderEditPng(e: TextEditT, pageW: number, pageH: number): Promis
   c.width = w
   c.height = h
   const ctx = c.getContext('2d')!
-  ctx.fillStyle = e.bg
-  ctx.fillRect(0, 0, w, h)
+  if (!e.cover) {
+    ctx.fillStyle = e.bg
+    ctx.fillRect(0, 0, w, h)
+  }
   ctx.fillStyle = e.color
   ctx.font = fontSpec(e, size * SCALE)
   ctx.textBaseline = 'middle'
@@ -23,6 +25,12 @@ async function renderEditPng(e: TextEditT, pageW: number, pageH: number): Promis
   const top = (h - lines.length * pitch) / 2 + pitch / 2
   ctx.textAlign = e.align === 'justify' ? 'left' : e.align
   const x = e.align === 'center' ? w / 2 : e.align === 'right' ? w : 0
+  if (e.outline) {
+    ctx.lineJoin = 'round'
+    ctx.strokeStyle = e.outline
+    ctx.lineWidth = size * SCALE * 0.18
+    lines.forEach((l, i) => ctx.strokeText(l, x, top + i * pitch))
+  }
   lines.forEach((l, i) => ctx.fillText(l, x, top + i * pitch))
   const blob: Blob = await new Promise((res) => c.toBlob((b) => res(b!), 'image/png'))
   return new Uint8Array(await blob.arrayBuffer())
@@ -36,6 +44,16 @@ export async function exportPdf(bytes: Uint8Array, edits: TextEditT[], comments:
     const page = pages[e.page - 1]
     if (!page) continue
     const { width: W, height: H } = page.getSize()
+    if (e.cover) {
+      const blob = await (await fetch(e.cover.img)).blob()
+      const jpg = await pdf.embedJpg(new Uint8Array(await blob.arrayBuffer()))
+      page.drawImage(jpg, {
+        x: e.cover.rect.x * W,
+        y: H - (e.cover.rect.y + e.cover.rect.h) * H,
+        width: e.cover.rect.w * W,
+        height: e.cover.rect.h * H,
+      })
+    }
     const png = await pdf.embedPng(await renderEditPng(e, W, H))
     page.drawImage(png, {
       x: e.rect.x * W,

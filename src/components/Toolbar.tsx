@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react'
-import { BoxSelect, Download, FolderOpen, MousePointer2, Minus, Plus, Type } from 'lucide-react'
+import { BoxSelect, SquarePen, Download, FolderOpen, MousePointer2, Minus, Plus, ScanText, Type } from 'lucide-react'
 import { exportPdf } from '../lib/export'
 import { useStore, type Tool } from '../store'
 
@@ -7,6 +7,7 @@ const tools: { id: Tool; label: string; Icon: typeof Type }[] = [
   { id: 'select', label: 'Select / comment', Icon: MousePointer2 },
   { id: 'region', label: 'Region comment', Icon: BoxSelect },
   { id: 'edit', label: 'Edit text', Icon: Type },
+  { id: 'box', label: 'Draw box', Icon: SquarePen },
 ]
 
 export function Toolbar() {
@@ -51,7 +52,7 @@ export function Toolbar() {
       {tools.map(({ id, label, Icon }) => (
         <button
           key={id}
-          title={label}
+          title={id === 'box' ? 'Drag a box over ANY lettering (even if it was not detected) and type the new text' : label}
           onClick={() => s.setTool(id)}
           className={`${btn} ${s.tool === id ? 'bg-blue-600' : 'bg-neutral-800 hover:bg-neutral-700'}`}
         >
@@ -72,6 +73,17 @@ export function Toolbar() {
             </button>
           ))}
         </div>
+      )}
+
+      {s.tool === 'edit' && s.numPages > 0 && (
+        <button
+          className={`${btn} bg-amber-600 hover:bg-amber-500 disabled:opacity-60`}
+          disabled={!!s.busy[s.page]}
+          onClick={() => window.dispatchEvent(new CustomEvent('mpe:ocr', { detail: s.page }))}
+          title="Finds lettering the PDF does not expose (big bold text). Takes a few seconds."
+        >
+          <ScanText size={16} /> {s.busy[s.page] ?? `Detect text (OCR) · p.${s.page}`}
+        </button>
       )}
 
       <div className="flex-1" />

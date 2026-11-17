@@ -1,12 +1,12 @@
-import { useRef } from 'react'
+import { useEffect, useRef } from 'react'
 import { clamp } from '../lib/geometry'
 import { fitSize } from '../lib/style'
 import { useStore, type TextEditT } from '../store'
 
-type Props = { edit: TextEditT; scale: number; pageW: number; pageH: number }
+type Props = { edit: TextEditT; scale: number; pageW: number; pageH: number; raised?: boolean }
 
 /** Inline editable text that covers the original lettering. Drag the top bar to move, corner to resize. */
-export function EditBox({ edit, scale, pageW, pageH }: Props) {
+export function EditBox({ edit, scale, pageW, pageH, raised }: Props) {
   const active = useStore((s) => s.activeEditId === edit.id)
   const setActiveEdit = useStore((s) => s.setActiveEdit)
   const setPanel = useStore((s) => s.setPanel)
@@ -14,6 +14,12 @@ export function EditBox({ edit, scale, pageW, pageH }: Props) {
   const ref = useRef<HTMLDivElement>(null)
 
   const size = fitSize(edit, pageW, pageH)
+
+  // a freshly drawn (still empty) box grabs the keyboard so you can type right away
+  useEffect(() => {
+    if (active && edit.blockId.startsWith('manual-') && !edit.text) ref.current?.focus()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const drag = (mode: 'move' | 'resize') => (ev: React.PointerEvent) => {
     ev.preventDefault()
@@ -44,18 +50,23 @@ export function EditBox({ edit, scale, pageW, pageH }: Props) {
 
   return (
     <div
-      className="absolute z-30 flex items-center justify-center"
+      className={`absolute ${raised ? 'z-[45]' : 'z-30'} flex items-center justify-center`}
       style={{
         left: `${edit.rect.x * 100}%`,
         top: `${edit.rect.y * 100}%`,
         width: `${edit.rect.w * 100}%`,
         height: `${edit.rect.h * 100}%`,
-        background: edit.bg,
+        background: edit.cover ? 'transparent' : edit.bg,
         outline: active ? '2px solid #3b82f6' : '1px solid transparent',
       }}
-      onMouseDown={() => {
+      onMouseDown={(e) => {
         setActiveEdit(edit.id)
         setPanel('format')
+        // clicking anywhere in the box (even if the text is empty / tiny) starts typing
+        if (e.target === e.currentTarget) {
+          e.preventDefault()
+          ref.current?.focus()
+        }
       }}
     >
       <div
@@ -63,13 +74,16 @@ export function EditBox({ edit, scale, pageW, pageH }: Props) {
         contentEditable
         suppressContentEditableWarning
         spellCheck
-        className="w-full outline-none"
+        className="min-h-[1em] w-full outline-none empty:before:text-neutral-400 empty:before:content-['Type…']"
         style={{
           fontFamily: `"${edit.font}", sans-serif`,
           fontSize: size * scale,
           fontWeight: edit.bold ? 700 : 400,
           fontStyle: edit.italic ? 'italic' : 'normal',
           color: edit.color,
+          ...(edit.outline
+            ? { WebkitTextStroke: `${Math.max(1, size * scale * 0.18)}px ${edit.outline}`, paintOrder: 'stroke fill' }
+            : {}),
           textAlign: edit.align,
           lineHeight: edit.lineHeight,
           whiteSpace: 'pre-wrap',

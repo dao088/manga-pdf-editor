@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import type { Rect } from './lib/geometry'
 
-export type Tool = 'select' | 'region' | 'edit'
+export type Tool = 'select' | 'region' | 'edit' | 'box'
 export type Granularity = 'line' | 'group'
 export type Align = 'left' | 'center' | 'right' | 'justify'
 
@@ -34,6 +34,10 @@ export type TextEditT = {
   align: Align
   lineHeight: number
   autoFit: boolean
+  /** rebuilt background under the removed lettering (fixed to the area it was made for) */
+  cover?: { rect: Rect; img: string; ink: string }
+  /** outline colour around the letters ('' = none) */
+  outline?: string
 }
 
 export type Block = {

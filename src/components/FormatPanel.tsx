@@ -1,5 +1,7 @@
 import { AlignCenter, AlignJustify, AlignLeft, AlignRight, Bold, Italic, Trash2, Undo2 } from 'lucide-react'
 import { FONTS } from '../lib/style'
+import { inpaintRegion } from '../lib/inpaint'
+import { getCanvas } from '../lib/pdf'
 import { useStore, type Align, type TextEditT } from '../store'
 
 const label = 'mb-1 block text-[11px] uppercase tracking-wide text-neutral-400'
@@ -89,6 +91,39 @@ export function FormatPanel() {
             <Icon size={15} />
           </button>
         ))}
+      </div>
+
+      <div>
+        <label className={label}>Old lettering</label>
+        <div className="flex gap-1 text-xs">
+          <button
+            onClick={() => {
+              const c = getCanvas(edit.page)
+              if (!c) return
+              const img = inpaintRegion(c, edit.rect, edit.cover?.ink ?? edit.color)
+              if (img) set({ cover: { rect: { ...edit.rect }, img, ink: edit.cover?.ink ?? edit.color } })
+            }}
+            className={`flex-1 rounded px-2 py-1.5 ${toggle(!!edit.cover)}`}
+            title="Rebuild the background under this box from its surroundings (keeps screentones)"
+          >
+            Remove text (rebuild bg)
+          </button>
+          <button onClick={() => set({ cover: undefined })} className={`flex-1 rounded px-2 py-1.5 ${toggle(!edit.cover)}`}>
+            Flat colour
+          </button>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-2 text-sm">
+        <input
+          type="checkbox"
+          checked={!!edit.outline}
+          onChange={(e) => set({ outline: e.target.checked ? '#ffffff' : '' })}
+        />
+        Outline
+        {edit.outline && (
+          <input type="color" className="h-6 w-10 cursor-pointer rounded bg-transparent" value={edit.outline} onChange={(e) => set({ outline: e.target.value })} />
+        )}
       </div>
 
       <label className="flex items-center gap-2 text-sm">
