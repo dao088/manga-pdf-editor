@@ -1,4 +1,6 @@
 allowBuilds:
+  esbuild: set this to true or false
+  protobufjs: false
   tesseract.js: false
 minimumReleaseAgeExclude:
   - lucide-react@1.74.0

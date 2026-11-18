@@ -1,5 +1,5 @@
 import type { PDFPageProxy } from 'pdfjs-dist'
-import { createWorker, PSM, type Worker } from 'tesseract.js'
+import { ocrCanvas } from './ppocr'
 import { pdfjs } from './pdf'
 import { overlapRatio, union, uid, type Rect } from './geometry'
 import { detectAlign } from './style'
@@ -17,7 +17,12 @@ const toRect = (b: { x0: number; y0: number; x1: number; y1: number }, W: number
 /** Real font name of a pdf.js font id (only available once the page has been rendered). */
 function realFontName(page: PDFPageProxy, id: string): string | undefined {
   try {
-    if (page.commonObjs.has(id)) return page.commonObjs.get(id)?.name as string | undefined
+    if (page.commonObjs.has(id)) {
+      const f = page.commonObjs.get(id) as { name?: string; bold?: boolean; italic?: boolean } | undefined
+      if (!f?.name) return undefined
+      // the real name is often generic (e.g. "*Verdana-5441"): add the style flags pdf.js knows
+      return `${f.name}${f.bold && !/bold/i.test(f.name) ? '-Bold' : ''}${f.italic && !/italic|oblique/i.test(f.name) ? '-Italic' : ''}`
+    }
   } catch {
     /* font not resolved yet */
   }
@@ -25,7 +30,7 @@ function realFontName(page: PDFPageProxy, id: string): string | undefined {
 }
 
 /** Merge boxes into paragraphs: vertically close + horizontally overlapping. */
-function groupLines(lines: Box[]): Box[][] {
+function groupLines(lines: Box[], blocked?: (a: Box, b: Box) => boolean): Box[][] {
   const parent = lines.map((_, i) => i)
   const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])))
   for (let i = 0; i < lines.length; i++) {
@@ -37,7 +42,11 @@ function groupLines(lines: Box[]): Box[][] {
       const fs = Math.max(a.fs, b.fs)
       const ov = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0)
       const minW = Math.min(a.x1 - a.x0, b.x1 - b.x0)
-      if (gap < fs * 0.6 && ov > minW * 0.3 && Math.abs(a.fs - b.fs) < fs * 0.4) parent[find(i)] = find(j)
+      const maxW = Math.max(a.x1 - a.x0, b.x1 - b.x0)
+      const centred = Math.abs((a.x0 + a.x1) / 2 - (b.x0 + b.x1) / 2) < maxW * 0.4
+      const leftAligned = Math.abs(a.x0 - b.x0) < fs * 1.2
+      if (gap < fs * 0.6 && ov > minW * 0.3 && Math.abs(a.fs - b.fs) < fs * 0.4 && (centred || leftAligned) && !blocked?.(a, b))
+        parent[find(i)] = find(j)
     }
   }
   const groups = new Map<number, Box[]>()
@@ -48,7 +57,7 @@ function groupLines(lines: Box[]): Box[][] {
   return [...groups.values()].map((g) => g.sort((p, q) => p.y0 - q.y0))
 }
 
-function makeBlocks(page: number, lines: Box[], W: number, H: number, source: 'pdf' | 'ocr', fontOf?: (b: Box) => string | undefined): BlockSet {
+function makeBlocks(page: number, lines: Box[], W: number, H: number, source: 'pdf' | 'ocr', fontOf?: (b: Box) => string | undefined, blocked?: (a: Box, b: Box) => boolean): BlockSet {
   const line: Block[] = lines.map((l) => ({
     id: uid(),
     page,
@@ -60,11 +69,13 @@ function makeBlocks(page: number, lines: Box[], W: number, H: number, source: 'p
     lineHeight: 1.2,
     source,
   }))
-  const group: Block[] = groupLines(lines).map((g) => {
+  const group: Block[] = groupLines(lines, blocked).map((g) => {
     const rects = g.map((l) => toRect(l, W, H))
     const pitch =
       g.length > 1 ? ((g[g.length - 1].y0 + g[g.length - 1].y1) / 2 - (g[0].y0 + g[0].y1) / 2) / (g.length - 1) : 0
-    const fs = g.reduce((s, l) => s + l.fs, 0) / g.length
+    let fs = g.reduce((s, l) => s + l.fs, 0) / g.length
+    // OCR line boxes hug the ink (shorter than the font size): the line pitch is the reliable measure
+    if (source === 'ocr' && pitch > 0) fs = pitch / 1.2
     return {
       id: uid(),
       page,
@@ -123,140 +134,102 @@ export async function blocksFromPdf(page: PDFPageProxy, pageNumber: number): Pro
   return makeBlocks(pageNumber, lines, viewport.width, viewport.height, 'pdf', (b) => (b.font ? realFontName(page, b.font) : undefined))
 }
 
-let worker: Promise<Worker> | null = null
-const getWorker = async () => {
-  worker ??= createWorker('eng')
-    .then(async (w) => {
-      await w.setParameters({ tessedit_pageseg_mode: PSM.SPARSE_TEXT })
-      return w
-    })
-    .catch((e) => {
-      worker = null // do not cache a failed load (e.g. offline), allow retry
-      throw e
-    })
-  return worker
-}
-
-const overlapsBox = (a: Box, b: Box) => {
-  const ix = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0)
-  const iy = Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0)
-  if (ix <= 0 || iy <= 0) return false
-  return (ix * iy) / Math.min((a.x1 - a.x0) * (a.y1 - a.y0), (b.x1 - b.x0) * (b.y1 - b.y0)) > 0.5
+/**
+ * Local OCR (PaddleOCR via ONNX/WASM, no internet) for text the PDF does not expose: lettering that is
+ * part of the page image. Every detected line keeps its own box so bubbles are never merged together.
+ */
+/**
+ * True when a speech-bubble outline (a thin dark line with light on both sides) lies between two text lines:
+ * they belong to different bubbles and must not be merged. Boxes are in page points, `scale` = px per point.
+ */
+function borderBetween(img: ImageData, scale: number, a: Box, b: Box): boolean {
+  const lum = (x: number, y: number) => {
+    if (x < 0 || y < 0 || x >= img.width || y >= img.height) return 128
+    const i = (Math.floor(y) * img.width + Math.floor(x)) * 4
+    return img.data[i] * 0.3 + img.data[i + 1] * 0.59 + img.data[i + 2] * 0.11
+  }
+  const inside = (bx: Box, x: number, y: number) => x >= bx.x0 - 3 && x <= bx.x1 + 3 && y >= bx.y0 - 3 && y <= bx.y1 + 3
+  const ax = (a.x0 + a.x1) / 2
+  const ay = (a.y0 + a.y1) / 2
+  const bx = (b.x0 + b.x1) / 2
+  const by = (b.y0 + b.y1) / 2
+  const len = Math.hypot(bx - ax, by - ay) * scale
+  let light = 0
+  let dark = 0
+  let sawLight = false
+  for (let t = 0; t <= len; t++) {
+    const px = ax + ((bx - ax) * t) / len
+    const py = ay + ((by - ay) * t) / len
+    if (inside(a, px, py) || inside(b, px, py)) {
+      light = dark = 0
+      sawLight = false
+      continue
+    }
+    const l = lum(px * scale, py * scale)
+    if (l > 170) {
+      if (dark >= 2 && dark <= 16 && sawLight && light >= 0) return true
+      light++
+      dark = 0
+      if (light >= 3) sawLight = true
+    } else if (l < 90) {
+      dark++
+      if (dark > 16) sawLight = false
+      light = 0
+    }
+  }
+  return false
 }
 
 /**
- * OCR fallback for text the PDF does not expose (e.g. big bold manga lettering).
- *
- * Manga lettering is usually pure black ink (often with a white outline) over grey screentones.
- * A normal contrast boost keeps the tones and confuses the OCR, so we run it on "ink only"
- * versions of the page (only very dark pixels survive) at two strictness levels and merge.
+ * Local OCR (PaddleOCR via ONNX/WASM, no internet) for text the PDF does not expose: lettering that is
+ * part of the page image. Lines already covered by real PDF text (`skip`) are ignored, so a bubble that has
+ * real text always uses the PDF's own text and font. Lines of different bubbles are never merged.
  */
-export async function blocksFromOcr(page: PDFPageProxy, pageNumber: number): Promise<BlockSet> {
+export async function blocksFromOcr(page: PDFPageProxy, pageNumber: number, skip: Rect[] = []): Promise<BlockSet> {
   const OCR_SCALE = 2
   const viewport = page.getViewport({ scale: OCR_SCALE })
   const canvas = document.createElement('canvas')
   canvas.width = Math.floor(viewport.width)
   canvas.height = Math.floor(viewport.height)
   await page.render({ canvas, viewport }).promise
-  const ctx = canvas.getContext('2d', { willReadFrequently: true })!
-  const original = ctx.getImageData(0, 0, canvas.width, canvas.height)
-
-  const w = await getWorker()
+  const found = await ocrCanvas(canvas)
+  const W = viewport.width / OCR_SCALE
+  const H = viewport.height / OCR_SCALE
   const lines: Box[] = []
-  for (const cutoff of [50, 80]) {
-    const img = new ImageData(new Uint8ClampedArray(original.data), original.width, original.height)
-    for (let i = 0; i < img.data.length; i += 4) {
-      const g = img.data[i] * 0.3 + img.data[i + 1] * 0.59 + img.data[i + 2] * 0.11
-      const v = g < cutoff ? 0 : 255
-      img.data[i] = img.data[i + 1] = img.data[i + 2] = v
-    }
-    ctx.putImageData(img, 0, 0)
-    const { data } = await w.recognize(canvas, {}, { blocks: true })
-    for (const block of data.blocks ?? []) {
-      for (const p of block.paragraphs) {
-        for (const l of p.lines) {
-          const text = l.text.trim()
-          const letters = (text.match(/[A-Za-z0-9]/g) ?? []).length
-          const bw = l.bbox.x1 - l.bbox.x0
-          const bh = l.bbox.y1 - l.bbox.y0
-          // drop noise: low confidence, too short, mostly symbols, or thin slivers
-          if (l.confidence < 40 || text.length < 3 || letters / text.length < 0.6) continue
-          if (bh < 14 || bw < bh * 0.8) continue
-          const box: Box = {
-            x0: l.bbox.x0 / OCR_SCALE,
-            x1: l.bbox.x1 / OCR_SCALE,
-            y0: l.bbox.y0 / OCR_SCALE,
-            y1: l.bbox.y1 / OCR_SCALE,
-            text,
-            fs: bh / OCR_SCALE / 1.2,
-          }
-          if (!lines.some((o) => overlapsBox(o, box))) lines.push(box)
-        }
-      }
-    }
+  for (const l of found) {
+    const letters = (l.text.match(/[A-Za-z0-9]/g) ?? []).length
+    const bh = l.y1 - l.y0
+    const bw = l.x1 - l.x0
+    if (l.conf < 0.6 || letters < 2 || letters / l.text.replace(/\s/g, '').length < 0.6) continue
+    if (bh < 10 || bw < 12) continue
+    const box = { x0: l.x0 / OCR_SCALE, x1: l.x1 / OCR_SCALE, y0: l.y0 / OCR_SCALE, y1: l.y1 / OCR_SCALE }
+    if (skip.some((r) => overlapRatio(r, toRect(box, W, H)) > 0.3)) continue
+    lines.push({ ...box, text: l.text, fs: bh / OCR_SCALE / 0.95 })
   }
-  return makeBlocks(pageNumber, lines, viewport.width / OCR_SCALE, viewport.height / OCR_SCALE, 'ocr')
+  const img = canvas.getContext('2d', { willReadFrequently: true })!.getImageData(0, 0, canvas.width, canvas.height)
+  return makeBlocks(pageNumber, lines, W, H, 'ocr', undefined, (a, b) => borderBetween(img, OCR_SCALE, a, b))
 }
 
-/**
- * Best-effort read of the text inside one user-drawn rectangle (normalized). The result is only a
- * suggestion: the manual box works even when this returns an empty string.
- */
+/** Best-effort read of the text inside one user-drawn rectangle (normalized). Only a suggestion. */
 export async function ocrRegion(page: PDFPageProxy, rect: Rect): Promise<{ text: string; lines: number }> {
   const SCALE = 3
   const base = page.getViewport({ scale: 1 })
+  const PAD = 16
   const viewport = page.getViewport({
     scale: SCALE,
-    offsetX: -rect.x * base.width * SCALE,
-    offsetY: -rect.y * base.height * SCALE,
+    offsetX: -rect.x * base.width * SCALE + PAD,
+    offsetY: -rect.y * base.height * SCALE + PAD,
   })
-  const PAD = 12
-  const cw = Math.max(8, Math.floor(rect.w * base.width * SCALE))
-  const ch = Math.max(8, Math.floor(rect.h * base.height * SCALE))
-  const src = document.createElement('canvas')
-  src.width = cw
-  src.height = ch
-  await page.render({ canvas: src, viewport }).promise
-  const sctx = src.getContext('2d', { willReadFrequently: true })!
-  const original = sctx.getImageData(0, 0, cw, ch)
-
-  const out = document.createElement('canvas')
-  out.width = cw + PAD * 2
-  out.height = ch + PAD * 2
-  const octx = out.getContext('2d')!
-
-  const w = await getWorker()
-  await w.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_BLOCK })
-  let best = { text: '', lines: 0, score: 0 }
-  try {
-    // dark ink on light (normal lettering) and light ink on dark (white text in black bubbles)
-    for (const [cutoff, inverted] of [[60, false], [100, false], [140, false], [190, true]] as const) {
-      const img = new ImageData(new Uint8ClampedArray(original.data), cw, ch)
-      for (let i = 0; i < img.data.length; i += 4) {
-        const g = img.data[i] * 0.3 + img.data[i + 1] * 0.59 + img.data[i + 2] * 0.11
-        const ink = inverted ? g > cutoff : g < cutoff
-        img.data[i] = img.data[i + 1] = img.data[i + 2] = ink ? 0 : 255
-      }
-      src.getContext('2d')!.putImageData(img, 0, 0)
-      octx.fillStyle = '#fff'
-      octx.fillRect(0, 0, out.width, out.height)
-      octx.drawImage(src, PAD, PAD)
-      const { data } = await w.recognize(out, {}, { blocks: true })
-      const lines = (data.blocks ?? [])
-        .flatMap((b) => b.paragraphs.flatMap((p) => p.lines))
-        .filter((l) => {
-          const t = l.text.trim()
-          const letters = (t.match(/[A-Za-z]/g) ?? []).length
-          return letters >= 3 && letters / t.replace(/\s/g, '').length >= 0.7 && l.confidence >= 30
-        })
-      const score =
-        lines.reduce((sum, l) => sum + (l.text.match(/[A-Za-z]/g) ?? []).length * l.confidence, 0) * (inverted ? 0.6 : 1)
-      if (score > best.score) best = { text: lines.map((l) => l.text.trim()).join(' '), lines: lines.length, score }
-    }
-  } finally {
-    await w.setParameters({ tessedit_pageseg_mode: PSM.SPARSE_TEXT })
-  }
-  return { text: best.text, lines: best.lines }
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(32, Math.floor(rect.w * base.width * SCALE) + PAD * 2)
+  canvas.height = Math.max(32, Math.floor(rect.h * base.height * SCALE) + PAD * 2)
+  const ctx = canvas.getContext('2d')!
+  ctx.fillStyle = '#fff'
+  ctx.fillRect(0, 0, canvas.width, canvas.height)
+  await page.render({ canvas, viewport }).promise
+  const found = (await ocrCanvas(canvas)).filter((l) => l.conf >= 0.5)
+  found.sort((a, b) => a.y0 - b.y0 || a.x0 - b.x0)
+  return { text: found.map((l) => l.text).join(' '), lines: found.length }
 }
 
 /** Adds OCR blocks that are not already covered by existing blocks. */

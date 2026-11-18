@@ -1,66 +1,76 @@
+import fontkit from '@pdf-lib/fontkit'
 import { PDFDocument, PDFHexString, PDFName } from 'pdf-lib'
-import { fitSize, fontSpec, wrapLines } from './style'
+import { editSig } from './style'
+import {
+  drawEditText,
+  embeddedFontPlan,
+  hexToRgb,
+  reuseFontPlan,
+  stripPageText,
+  type FontCache,
+  type StripHit,
+} from './pdfText'
 import type { CommentT, TextEditT } from '../store'
 
-const SCALE = 3
-
-async function renderEditPng(e: TextEditT, pageW: number, pageH: number): Promise<Uint8Array> {
-  const size = fitSize(e, pageW, pageH)
-  await document.fonts.load(fontSpec(e, size))
-  const w = Math.ceil(e.rect.w * pageW * SCALE)
-  const h = Math.ceil(e.rect.h * pageH * SCALE)
-  const c = document.createElement('canvas')
-  c.width = w
-  c.height = h
-  const ctx = c.getContext('2d')!
-  if (!e.cover) {
-    ctx.fillStyle = e.bg
-    ctx.fillRect(0, 0, w, h)
-  }
-  ctx.fillStyle = e.color
-  ctx.font = fontSpec(e, size * SCALE)
-  ctx.textBaseline = 'middle'
-  const lines = wrapLines(ctx, e.text, w)
-  const pitch = size * SCALE * e.lineHeight
-  const top = (h - lines.length * pitch) / 2 + pitch / 2
-  ctx.textAlign = e.align === 'justify' ? 'left' : e.align
-  const x = e.align === 'center' ? w / 2 : e.align === 'right' ? w : 0
-  if (e.outline) {
-    ctx.lineJoin = 'round'
-    ctx.strokeStyle = e.outline
-    ctx.lineWidth = size * SCALE * 0.18
-    lines.forEach((l, i) => ctx.strokeText(l, x, top + i * pitch))
-  }
-  lines.forEach((l, i) => ctx.fillText(l, x, top + i * pitch))
-  const blob: Blob = await new Promise((res) => c.toBlob((b) => res(b!), 'image/png'))
-  return new Uint8Array(await blob.arrayBuffer())
+export type ExportHooks = {
+  /** bytes of a real font file (so the new text keeps the original look); null = use a standard font */
+  fontBytes?: (family: string, bold: boolean, italic: boolean) => Promise<Uint8Array | null>
 }
 
-export async function exportPdf(bytes: Uint8Array, edits: TextEditT[], comments: CommentT[]): Promise<Uint8Array> {
+async function buildPdf(
+  bytes: Uint8Array,
+  allEdits: TextEditT[],
+  comments: CommentT[],
+  hooks: ExportHooks = {},
+): Promise<Uint8Array> {
   const pdf = await PDFDocument.load(bytes.slice())
+  pdf.registerFontkit(fontkit)
   const pages = pdf.getPages()
+  const fonts: FontCache = new Map()
 
+  // blocks of real PDF text that were opened but not changed stay exactly as they are
+  const edits = allEdits.filter((e) => !(e.origRect && e.sig && e.sig === editSig(e)))
+
+  // 1) like Acrobat: delete the original text from the page content itself
+  const removed = new Map<string, StripHit>()
+  const byPage = new Map<number, TextEditT[]>()
+  for (const e of edits) if (e.origRect) byPage.set(e.page, [...(byPage.get(e.page) ?? []), e])
+  for (const [n, list] of byPage) {
+    const page = pages[n - 1]
+    if (!page) continue
+    const hits = stripPageText(pdf, page, list.map((e) => ({ id: e.id, rect: e.origRect! })))
+    hits.forEach((h, id) => removed.set(id, h))
+  }
+
+  // 2) background where needed + the new text, as real text
   for (const e of edits) {
     const page = pages[e.page - 1]
     if (!page) continue
-    const { width: W, height: H } = page.getSize()
+    const cb = page.getCropBox()
     if (e.cover) {
       const blob = await (await fetch(e.cover.img)).blob()
       const jpg = await pdf.embedJpg(new Uint8Array(await blob.arrayBuffer()))
       page.drawImage(jpg, {
-        x: e.cover.rect.x * W,
-        y: H - (e.cover.rect.y + e.cover.rect.h) * H,
-        width: e.cover.rect.w * W,
-        height: e.cover.rect.h * H,
+        x: cb.x + e.cover.rect.x * cb.width,
+        y: cb.y + cb.height - (e.cover.rect.y + e.cover.rect.h) * cb.height,
+        width: e.cover.rect.w * cb.width,
+        height: e.cover.rect.h * cb.height,
+      })
+    } else if (!(removed.get(e.id)?.visible ?? 0)) {
+      // the lettering is part of the page image (or its text was invisible): paint the background over it
+      page.drawRectangle({
+        x: cb.x + e.rect.x * cb.width,
+        y: cb.y + cb.height - (e.rect.y + e.rect.h) * cb.height,
+        width: e.rect.w * cb.width,
+        height: e.rect.h * cb.height,
+        color: hexToRgb(e.bg),
       })
     }
-    const png = await pdf.embedPng(await renderEditPng(e, W, H))
-    page.drawImage(png, {
-      x: e.rect.x * W,
-      y: H - (e.rect.y + e.rect.h) * H,
-      width: e.rect.w * W,
-      height: e.rect.h * H,
-    })
+    if (!e.text.trim()) continue
+    const plan =
+      reuseFontPlan(page, removed.get(e.id)?.fontRes, e) ??
+      (await embeddedFontPlan(pdf, page, e, e.text, hooks.fontBytes, fonts))
+    drawEditText(page, plan, e)
   }
 
   const ctx = pdf.context
@@ -100,4 +110,15 @@ export async function exportPdf(bytes: Uint8Array, edits: TextEditT[], comments:
     page.node.addAnnot(ctx.register(annot))
   }
   return pdf.save()
+}
+
+/** Builds the PDF; if embedding a custom font breaks, retries with standard PDF fonts instead of failing. */
+export async function exportPdf(bytes: Uint8Array, edits: TextEditT[], comments: CommentT[], hooks: ExportHooks = {}): Promise<Uint8Array> {
+  try {
+    return await buildPdf(bytes, edits, comments, hooks)
+  } catch (err) {
+    if (!hooks.fontBytes) throw err
+    console.warn('export with custom fonts failed, retrying with standard fonts', err)
+    return buildPdf(bytes, edits, comments, {})
+  }
 }

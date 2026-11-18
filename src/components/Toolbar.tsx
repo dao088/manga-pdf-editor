@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react'
 import { BoxSelect, SquarePen, Download, FolderOpen, MousePointer2, Minus, Plus, ScanText, Type } from 'lucide-react'
 import { exportPdf } from '../lib/export'
+import { loadFontBytes } from '../lib/fontBytes'
 import { useStore, type Tool } from '../store'
 
 const tools: { id: Tool; label: string; Icon: typeof Type }[] = [
@@ -21,7 +22,7 @@ export function Toolbar() {
     if (!s.bytes || !s.fileName) return
     setExporting(true)
     try {
-      const out = await exportPdf(s.bytes, s.edits, s.comments)
+      const out = await exportPdf(s.bytes, s.edits, s.comments, { fontBytes: loadFontBytes })
       const url = URL.createObjectURL(new Blob([out.slice().buffer as ArrayBuffer], { type: 'application/pdf' }))
       const a = document.createElement('a')
       a.href = url

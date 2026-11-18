@@ -141,3 +141,25 @@ export function detectAlign(lines: Rect[]): Align {
   if (spread(lefts) <= tol && spread(centers) > tol) return 'left'
   return 'center'
 }
+
+/** Fraction of the block covered by ink-coloured pixels: heavy lettering (titles, shouts) is > ~0.3. */
+export function inkRatio(canvas: HTMLCanvasElement, rect: Rect, color: string): number {
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })
+  if (!ctx) return 0
+  const x = Math.max(0, Math.floor(rect.x * canvas.width))
+  const y = Math.max(0, Math.floor(rect.y * canvas.height))
+  const w = Math.min(canvas.width - x, Math.ceil(rect.w * canvas.width))
+  const h = Math.min(canvas.height - y, Math.ceil(rect.h * canvas.height))
+  if (w < 2 || h < 2) return 0
+  const d = ctx.getImageData(x, y, w, h).data
+  const r = parseInt(color.slice(1, 3), 16)
+  const g = parseInt(color.slice(3, 5), 16)
+  const b = parseInt(color.slice(5, 7), 16)
+  let n = 0
+  for (let i = 0; i < d.length; i += 4) if (Math.abs(d[i] - r) + Math.abs(d[i + 1] - g) + Math.abs(d[i + 2] - b) < 120) n++
+  return n / (w * h)
+}
+
+/** Everything the user can change in an edit. Equal to the stored `sig` => the block was left untouched. */
+export const editSig = (e: TextEditT) =>
+  JSON.stringify([e.text, e.font, e.size, e.color, e.bold, e.italic, e.align, e.lineHeight, e.autoFit, e.outline ?? '', e.rect])

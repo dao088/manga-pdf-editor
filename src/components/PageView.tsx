@@ -3,12 +3,14 @@ import { ScanText, MessageSquare } from 'lucide-react'
 import { pdfjs, registerCanvas, getCanvas, type PDFDocumentProxy } from '../lib/pdf'
 import { blocksFromOcr, blocksFromPdf, mergeBlockSets, ocrRegion } from '../lib/blocks'
 import { clamp, contains, uid, type Rect } from '../lib/geometry'
-import { inpaintRegion } from '../lib/inpaint'
-import { detectColors, parseFontName } from '../lib/style'
+import { detectLook, inpaintRegion } from '../lib/inpaint'
+import { detectColors, editSig, parseFontName } from '../lib/style'
 import { useStore, type Block, type TextEditT } from '../store'
 import { EditBox } from './EditBox'
 
 type Props = { doc: PDFDocumentProxy; pageNumber: number }
+
+let ocrQueue: Promise<unknown> = Promise.resolve()
 
 export function PageView({ doc, pageNumber }: Props) {
   const scale = useStore((s) => s.scale)
@@ -111,7 +113,8 @@ export function PageView({ doc, pageNumber }: Props) {
     s.setBusy(pageNumber, 'Running OCR…')
     try {
       const page = await doc.getPage(pageNumber)
-      const ocr = await blocksFromOcr(page, pageNumber)
+      const have = st.getState().blocks[pageNumber]?.line.filter((b) => b.source === 'pdf').map((b) => b.rect) ?? []
+      const ocr = await blocksFromOcr(page, pageNumber, have)
       s.setBlocks(pageNumber, mergeBlockSets(st.getState().blocks[pageNumber], ocr))
       flash(`Found ${ocr.group.length} blocks — missing something? Use "Draw box"`, 5000)
     } catch (e) {
@@ -131,11 +134,33 @@ export function PageView({ doc, pageNumber }: Props) {
     return () => window.removeEventListener('mpe:ocr', onOcr)
   }, [pageNumber])
 
-  const createEdit = (b: Block) => {
+  // like Acrobat: entering the edit tool detects the lettering by itself (queued, one page at a time)
+  const autoRan = useRef(false)
+  useEffect(() => {
+    if (tool !== 'edit' || !visible || !blocks || autoRan.current) return
+    autoRan.current = true
+    st.getState().setBusy(pageNumber, 'Waiting for OCR…')
+    ocrQueue = ocrQueue.then(() => runOcrRef.current()).catch(() => undefined)
+  }, [tool, visible, blocks, pageNumber, st])
+
+  const nextFrame = () => new Promise<void>((r) => setTimeout(r, 30))
+
+  const createEdit = async (b: Block) => {
     const s = st.getState()
+    const existing = s.edits.find((e) => e.page === pageNumber && e.blockId === b.id)
+    if (existing) return s.setActiveEdit(existing.id)
     const canvas = getCanvas(pageNumber)
     const colors = canvas ? detectColors(canvas, b.rect) : { bg: '#ffffff', color: '#000000' }
     const f = parseFontName(b.fontName)
+    // lettering baked in the page image: copy its look (heavy? outline?) since there is no font to read
+    const look = canvas && !b.fontName ? detectLook(canvas, b.rect, colors.color, colors.bg) : { heavy: false, outline: '' }
+    let rectCover: TextEditT['cover']
+    if (canvas && b.source === 'ocr') {
+      s.setBusy(pageNumber, 'Rebuilding background…')
+      await nextFrame() // let the label paint before the heavy work
+      rectCover = coverFor(canvas, b.rect, colors.color)
+      st.getState().setBusy(pageNumber, undefined)
+    }
     const padX = b.rect.w * 0.04
     const padY = b.rect.h * 0.06
     const rect: Rect = {
@@ -144,8 +169,6 @@ export function PageView({ doc, pageNumber }: Props) {
       w: Math.min(1, b.rect.w + padX * 2),
       h: Math.min(1, b.rect.h + padY * 2),
     }
-    const existing = s.edits.find((e) => e.page === pageNumber && e.blockId === b.id)
-    if (existing) return s.setActiveEdit(existing.id)
     const edit: TextEditT = {
       id: uid(),
       page: pageNumber,
@@ -153,17 +176,21 @@ export function PageView({ doc, pageNumber }: Props) {
       rect,
       original: b.text,
       text: b.text,
-      font: f.font,
+      font: look.heavy ? 'Anton' : f.font, // heavy baked-in lettering is condensed display type: Anton is the closest we have
       size: Math.max(6, Math.round(b.fontSize * 2) / 2),
       color: colors.color,
       bg: colors.bg,
-      bold: f.bold,
+      bold: look.heavy ? false : f.bold,
       italic: f.italic,
       align: b.align,
       lineHeight: Math.round(b.lineHeight * 100) / 100,
       autoFit: true,
+      cover: rectCover,
+      outline: look.outline || undefined,
+      origRect: b.source === 'pdf' ? b.rect : undefined,
     }
-    s.addEdit(edit)
+    if (edit.origRect) edit.sig = editSig(edit)
+    st.getState().addEdit(edit)
   }
 
   const norm = (e: { clientX: number; clientY: number }) => {
@@ -247,6 +274,7 @@ export function PageView({ doc, pageNumber }: Props) {
     const s = st.getState()
     const canvas = getCanvas(pageNumber)
     const colors = canvas ? detectColors(canvas, rect) : { bg: '#ffffff', color: '#000000' }
+    const look = canvas ? detectLook(canvas, rect, colors.color, colors.bg) : { heavy: true, outline: '' }
     const id = uid()
     const hPt = rect.h * dims.h
     s.addEdit({
@@ -256,17 +284,17 @@ export function PageView({ doc, pageNumber }: Props) {
       rect,
       original: '',
       text: '',
-      font: 'Comic Neue',
+      font: look.heavy ? 'Anton' : 'Comic Neue',
       size: Math.max(6, Math.round((hPt / 1.3) * 2) / 2),
       color: colors.color,
       bg: colors.bg,
-      bold: true,
+      bold: false,
       italic: false,
       align: 'center',
       lineHeight: 1.15,
       autoFit: true,
       cover: canvas ? coverFor(canvas, rect, colors.color) : undefined,
-      outline: colors.bg === '#ffffff' || parseInt(colors.bg.slice(1, 3), 16) > 200 ? '' : '#ffffff',
+      outline: look.outline,
     })
     // optional suggestion: never blocks typing, only fills the box if it is still empty
     s.setBusy(pageNumber, 'Reading text…')
@@ -293,7 +321,10 @@ export function PageView({ doc, pageNumber }: Props) {
   return (
     <div className="mx-auto mb-6" style={{ width: pxW }}>
       <div className="mb-1 flex items-center justify-between text-xs text-neutral-400">
-        <span>Page {pageNumber}</span>
+        <span>
+          Page {pageNumber}
+          {tool === 'edit' && <span className="ml-3 text-blue-300">Click a blue block, or drag a box over any lettering that has none</span>}
+        </span>
         {(tool === 'edit' || tool === 'box') && (
           <button
             onClick={runOcr}
@@ -377,6 +408,18 @@ export function PageView({ doc, pageNumber }: Props) {
                   width: `${drag.w * 100}%`,
                   height: `${drag.h * 100}%`,
                 }}
+              />
+            )}
+          </div>
+        )}
+
+        {/* edit tool: drag on any empty area (under the detected blocks) to draw a box over undetected lettering */}
+        {tool === 'edit' && (
+          <div className="absolute inset-0 z-[35] cursor-crosshair" onPointerDown={onBoxDown}>
+            {drag && (
+              <div
+                className="absolute border-2 border-dashed border-blue-500 bg-blue-500/15"
+                style={{ left: `${drag.x * 100}%`, top: `${drag.y * 100}%`, width: `${drag.w * 100}%`, height: `${drag.h * 100}%` }}
               />
             )}
           </div>

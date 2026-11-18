@@ -16,7 +16,7 @@ pnpm dev
   and replaced by editable text. Font / size / colour / alignment / line height are auto-detected and editable in
   the **Format** tab. `Inline` = one line per block, `Group` = whole paragraph or bubble.
 - **Detect more text (OCR)**: tesseract.js on the page for text the PDF does not expose (big bold lettering).
-- **Export PDF**: edits are flattened as images over the original; comments become real PDF Highlight / Text annotations.
+- **Export PDF**: like Acrobat. For text the PDF really contains, the original text is **deleted from the page content** and the new text is written as **real, selectable text** (same font resource when it can draw the new text, otherwise the chosen font embedded). Blocks you opened but did not change are left byte-for-byte untouched. Lettering that is part of the page image (OCR blocks) still gets a rebuilt background + real text on top. Comments become real PDF Highlight / Text annotations.
 - Comments and edits are saved in `localStorage` per file (name + size).
 
 ## Layout
@@ -32,4 +32,8 @@ pnpm dev
 - Font detection is exact only when the PDF exposes the real font name (e.g. Acrobat-OCR'd files). For OCR-only
   blocks it defaults to Comic Neue and you pick the font by hand.
 - Only upright (non-rotated) pages.
-- Export flattens edited text to images (keeps any web font, but is not selectable afterwards).
+- Real-text removal handles text in the page's own content stream (what Acrobat OCR / editing produces), not text inside Form XObjects.
+- The editor fonts (Comic Neue, Anton, Bangers, Patrick Hand, Bodoni Moda) are bundled with the app (@fontsource) and the same files are embedded in the exported PDF, so preview == export, offline. Verdana / Arial / Times are embedded through Chrome's Local Font Access (asks permission on export); without it a standard PDF font is used. fontkit cannot subset WOFF2, which is why WOFF files are used. If embedding ever fails, the export retries with standard fonts instead of failing.
+- "Remove text (rebuild bg)" uses exemplar inpainting: hatching and screentones continue through the old lettering. Heavy lettering baked into the image is detected and gets Anton + the white outline when the original had one.
+- Pending: detecting the original font of lettering that is part of the image (WhatTheFont-style).
+- Tests: `python3 test/make_fixture.py test/fixture.pdf && npx tsx test/export.test.ts test/fixture.pdf test/out.pdf`

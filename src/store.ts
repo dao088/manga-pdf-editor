@@ -38,6 +38,10 @@ export type TextEditT = {
   cover?: { rect: Rect; img: string; ink: string }
   /** outline colour around the letters ('' = none) */
   outline?: string
+  /** where the original (real PDF) text was: used at export to delete exactly that text */
+  origRect?: Rect
+  /** signature of the edit when it was created: an untouched edit is skipped at export */
+  sig?: string
 }
 
 export type Block = {
